@@ -13,13 +13,13 @@
 #include <chrono>
 #include <atomic>
 #include <iomanip>
+#include <cstdio>
 
 #ifdef _WIN32
     #include <conio.h>
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <ws2ipdef.h>
-    // Link with Ws2_32.lib
     #pragma comment(lib, "Ws2_32.lib")
 #else
     #include <sys/socket.h>
@@ -44,7 +44,6 @@
 
 #define BUFFER_SIZE 2048
 
-// Color namespace for beautiful terminal styling
 namespace color {
     const char* RESET   = "\033[0m";
     const char* BOLD    = "\033[1m";
@@ -53,7 +52,6 @@ namespace color {
     const char* RED     = "\033[31m";
 }
 
-// Column widths for the device table
 const int W_ID   = 4;
 const int W_NAME = 16;
 const int W_USER = 16;
@@ -81,15 +79,13 @@ std::string g_myHostName;
 std::string g_chatPartnerName = "Peer";
 int g_myTcpPort = 0;
 
-std::string g_backendIp;
-int g_backendPort = 8000;
+std::string g_backendUrl = "https://trggo.vercel.app";
 
 std::vector<std::string> g_chatHistory;
 std::mutex g_chatMutex;
 std::atomic<bool> g_chatNeedRedraw(true);
 
 #ifndef _WIN32
-// POSIX kbhit and getch implementation for Linux/Termux/macOS
 int _kbhit() {
     static const int STDIN = 0;
     static bool initialized = false;
@@ -115,72 +111,53 @@ int _getch() {
 }
 #endif
 
-// Cross-platform Screen Clear using ANSI escape sequences
 void ClearScreen() {
     std::cout << "\033[2J\033[1;1H" << std::flush;
 }
 
-// Raw C++ HTTP Request client (Supports both IPv4 and IPv6)
-std::string SendHttpRequest(const std::string& method, const std::string& path, const std::string& body) {
-    bool isIPv6 = (g_backendIp.find(':') != std::string::npos);
-    SOCKET sock = socket(isIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        return "";
+// Executes a shell command and captures stdout
+std::string ExecuteCommand(const std::string& cmd) {
+    std::string result = "";
+    char buffer[128];
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return "";
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        result += buffer;
     }
-
-    if (isIPv6) {
-        sockaddr_in6 serverAddr = {};
-        serverAddr.sin6_family = AF_INET6;
-        serverAddr.sin6_port = htons(g_backendPort);
-        if (inet_pton(AF_INET6, g_backendIp.c_str(), &serverAddr.sin6_addr) != 1) {
-            closesocket(sock);
-            return "";
-        }
-        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-            closesocket(sock);
-            return "";
-        }
-    } else {
-        sockaddr_in serverAddr = {};
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(g_backendPort);
-        if (inet_pton(AF_INET, g_backendIp.c_str(), &serverAddr.sin_addr) != 1) {
-            closesocket(sock);
-            return "";
-        }
-        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-            closesocket(sock);
-            return "";
-        }
-    }
-
-    std::string hostHeader = g_backendIp;
-    if (isIPv6) {
-        hostHeader = "[" + g_backendIp + "]";
-    }
-
-    std::string request = method + " " + path + " HTTP/1.1\r\n" +
-                          "Host: " + hostHeader + ":" + std::to_string(g_backendPort) + "\r\n" +
-                          "Content-Type: application/json\r\n" +
-                          "Content-Length: " + std::to_string(body.length()) + "\r\n" +
-                          "Connection: close\r\n\r\n" +
-                          body;
-
-    send(sock, request.c_str(), (int)request.length(), 0);
-
-    std::string response = "";
-    char buffer[1024];
-    int bytes;
-    while ((bytes = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes] = '\0';
-        response += buffer;
-    }
-
-    closesocket(sock);
-    return response;
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return result;
 }
 
-// Thread to periodically send HTTP heartbeats to the tracker
+// WAN-friendly HTTP/HTTPS request executor using system curl
+std::string SendHttpRequest(const std::string& method, const std::string& path, const std::string& body) {
+    std::string fullUrl = g_backendUrl + path;
+    std::string cmd = "curl -s -L -X " + method;
+    
+    if (!body.empty()) {
+#ifdef _WIN32
+        // Escape quotes for Windows cmd shell
+        std::string escapedBody = "";
+        for (char c : body) {
+            if (c == '"') escapedBody += "\\\"";
+            else escapedBody += c;
+        }
+        cmd += " -H \"Content-Type: application/json\" -d \"" + escapedBody + "\"";
+#else
+        cmd += " -H 'Content-Type: application/json' -d '" + body + "'";
+#endif
+    }
+    cmd += " \"" + fullUrl + "\"";
+    return ExecuteCommand(cmd);
+}
+
 void HTTPHeartbeatSender() {
     std::string deviceId = g_myName + "_" + std::to_string(g_myTcpPort);
     while (g_running) {
@@ -197,7 +174,6 @@ void HTTPHeartbeatSender() {
     }
 }
 
-// Thread to periodically fetch online peers from the tracker
 void HTTPPeerFetcher() {
     while (g_running) {
         if (!g_inChat) {
@@ -241,17 +217,11 @@ void HTTPPeerFetcher() {
                             int devPort = portStr.empty() ? 0 : std::stoi(portStr);
 
                             // Resolve IPv6 local loopback formats
-                            if (devIp == "::" || devIp == "::ffff:127.0.0.1" || devIp == "127.0.0.1") {
+                            if (devIp == "::" || devIp == "::ffff:127.0.0.1" || devIp == "127.0.0.1" || devIp == "::1") {
+                                // Default to loopback address format
                                 devIp = "::1";
                             }
 
-                            // Skip ourselves
-                            if (devName == g_myName && devPort == g_myTcpPort) {
-                                objStart = objEnd + 1;
-                                continue;
-                            }
-
-                            // Add online devices to active peer map
                             if (devStatus == "online" && !devName.empty() && devPort > 0) {
                                 Peer p;
                                 p.ip = devIp;
@@ -268,7 +238,6 @@ void HTTPPeerFetcher() {
                             objStart = objEnd + 1;
                         }
 
-                        // Determine if list changed to avoid flickering
                         bool changed = false;
                         {
                             std::lock_guard<std::mutex> lock(g_peerMutex);
@@ -296,7 +265,6 @@ void HTTPPeerFetcher() {
     }
 }
 
-// TCP Chat Server thread to accept incoming chat connections
 void TCPLServer() {
     SOCKET listenSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listenSocket == INVALID_SOCKET) {
@@ -369,7 +337,6 @@ void TCPLServer() {
     closesocket(listenSocket);
 }
 
-// Thread to receive messages in a chat session
 void ReceiveMessages(SOCKET peerSocket) {
     char buffer[BUFFER_SIZE];
     while (g_inChat && g_running) {
@@ -437,28 +404,31 @@ int main() {
         g_myName = "AnonymousPeer";
     }
 
-    std::cout << "Enter Tracker IP (default 127.0.0.1): ";
-    std::string ipInput;
-    std::getline(std::cin, ipInput);
-    g_backendIp = ipInput.empty() ? "127.0.0.1" : ipInput;
+    std::cout << "Enter Tracker Base URL (default https://trggo.vercel.app): ";
+    std::string urlInput;
+    std::getline(std::cin, urlInput);
+    if (!urlInput.empty()) {
+        g_backendUrl = urlInput;
+    }
 
-    std::cout << "Enter Tracker Port (default 8000): ";
-    std::string portInput;
-    std::getline(std::cin, portInput);
-    g_backendPort = portInput.empty() ? 8000 : std::stoi(portInput);
+    // Auto prepend https:// if protocol is omitted
+    if (g_backendUrl.rfind("http", 0) != 0) {
+        g_backendUrl = "https://" + g_backendUrl;
+    }
+    // Trim trailing slash
+    if (!g_backendUrl.empty() && g_backendUrl.back() == '/') {
+        g_backendUrl.pop_back();
+    }
 
-    // 2. Start TCP Chat Server (assigns ephemeral port)
     std::thread tcpServerThread(TCPLServer);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // 3. Start HTTP Heartbeat Sender & online peer fetcher
     std::thread heartbeatThread(HTTPHeartbeatSender);
     std::thread fetcherThread(HTTPPeerFetcher);
 
     std::vector<Peer> activePeersList;
     std::string currentInput = "";
 
-    // Helper lambda to draw table line
     auto hline = [&]() {
         std::cout << "  +"
                   << std::string(W_ID   + 2, '-') << "+"
@@ -574,41 +544,46 @@ int main() {
                         int selection = std::stoi(targetIdStr);
                         if (selection >= 1 && selection <= (int)activePeersList.size()) {
                             Peer target = activePeersList[selection - 1];
-                            std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
+                            if (target.name == g_myName && target.port == g_myTcpPort) {
+                                std::cout << color::RED << "[System]: You cannot connect to yourself!" << color::RESET << "\n";
+                                std::this_thread::sleep_for(std::chrono::seconds(2));
+                                g_needRedraw = true;
+                            } else {
+                                std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
 
-                            // Determine if connecting IP is IPv6 or IPv4
-                            bool isTargetIPv6 = (target.ip.find(':') != std::string::npos);
-                            SOCKET connectSocket = socket(isTargetIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                            
-                            if (connectSocket != INVALID_SOCKET) {
-                                bool connected = false;
-                                if (isTargetIPv6) {
-                                    sockaddr_in6 peerAddr = {};
-                                    peerAddr.sin6_family = AF_INET6;
-                                    peerAddr.sin6_port = htons(target.port);
-                                    inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
-                                    if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
-                                        connected = true;
+                                bool isTargetIPv6 = (target.ip.find(':') != std::string::npos);
+                                SOCKET connectSocket = socket(isTargetIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                                
+                                if (connectSocket != INVALID_SOCKET) {
+                                    bool connected = false;
+                                    if (isTargetIPv6) {
+                                        sockaddr_in6 peerAddr = {};
+                                        peerAddr.sin6_family = AF_INET6;
+                                        peerAddr.sin6_port = htons(target.port);
+                                        inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
+                                        if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                            connected = true;
+                                        }
+                                    } else {
+                                        sockaddr_in peerAddr = {};
+                                        peerAddr.sin_family = AF_INET;
+                                        peerAddr.sin_port = htons(target.port);
+                                        inet_pton(AF_INET, target.ip.c_str(), &peerAddr.sin_addr);
+                                        if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                            connected = true;
+                                        }
                                     }
-                                } else {
-                                    sockaddr_in peerAddr = {};
-                                    peerAddr.sin_family = AF_INET;
-                                    peerAddr.sin_port = htons(target.port);
-                                    inet_pton(AF_INET, target.ip.c_str(), &peerAddr.sin_addr);
-                                    if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
-                                        connected = true;
-                                    }
-                                }
 
-                                if (connected) {
-                                    g_chatPartnerName = target.name;
-                                    g_chatSocket = connectSocket;
-                                    g_inChat = true;
-                                } else {
-                                    std::cerr << "[System]: Connection failed. Error: " << WSAGetLastError() << "\n";
-                                    closesocket(connectSocket);
-                                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                                    g_needRedraw = true;
+                                    if (connected) {
+                                        g_chatPartnerName = target.name;
+                                        g_chatSocket = connectSocket;
+                                        g_inChat = true;
+                                    } else {
+                                        std::cerr << "[System]: Connection failed. Error: " << WSAGetLastError() << "\n";
+                                        closesocket(connectSocket);
+                                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                                        g_needRedraw = true;
+                                    }
                                 }
                             }
                         } else {
