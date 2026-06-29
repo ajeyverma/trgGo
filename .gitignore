@@ -1,0 +1,30 @@
+# C++ Build Artifacts
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.suo
+*.user
+
+# Node.js backend dependencies & logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.vcxproj
+*.filters

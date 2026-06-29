@@ -13,14 +13,35 @@
 #include <chrono>
 #include <atomic>
 #include <iomanip>
-#include <conio.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <ws2ipdef.h>
 
-#pragma comment(lib, "Ws2_32.lib")
+#ifdef _WIN32
+    #include <conio.h>
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <ws2ipdef.h>
+    // Link with Ws2_32.lib
+    #pragma comment(lib, "Ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <netdb.h>
+    #include <sys/ioctl.h>
+    #include <termios.h>
+    #include <sys/select.h>
+    #include <errno.h>
 
-#define DISCOVERY_PORT 9999
+    typedef int SOCKET;
+    #define INVALID_SOCKET -1
+    #define SOCKET_ERROR -1
+    #define SD_BOTH SHUT_RDWR
+    #define closesocket close
+    #define WSAGetLastError() errno
+    #define WSAEINTR EINTR
+    #define WSAENOTSOCK EBADF
+#endif
+
 #define BUFFER_SIZE 2048
 
 // Color namespace for beautiful terminal styling
@@ -36,7 +57,7 @@ namespace color {
 const int W_ID   = 4;
 const int W_NAME = 16;
 const int W_USER = 16;
-const int W_IP   = 22;
+const int W_IP   = 48;
 const int W_STAT = 8;
 
 struct Peer {
@@ -60,153 +81,219 @@ std::string g_myHostName;
 std::string g_chatPartnerName = "Peer";
 int g_myTcpPort = 0;
 
-// Prune peers that haven't sent a beacon in 6 seconds
-void PruneOfflinePeers() {
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        if (g_inChat) continue;
+std::string g_backendIp;
+int g_backendPort = 8000;
 
-        auto now = std::chrono::steady_clock::now();
-        bool changed = false;
-        {
-            std::lock_guard<std::mutex> lock(g_peerMutex);
-            for (auto it = g_peers.begin(); it != g_peers.end(); ) {
-                auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastSeen).count();
-                if (duration > 6) {
-                    it = g_peers.erase(it);
-                    changed = true;
-                } else {
-                    ++it;
-                }
-            }
-        }
-        if (changed) {
-            g_needRedraw = true;
-        }
+std::vector<std::string> g_chatHistory;
+std::mutex g_chatMutex;
+std::atomic<bool> g_chatNeedRedraw(true);
+
+#ifndef _WIN32
+// POSIX kbhit and getch implementation for Linux/Termux/macOS
+int _kbhit() {
+    static const int STDIN = 0;
+    static bool initialized = false;
+
+    if (!initialized) {
+        termios term;
+        tcgetattr(STDIN, &term);
+        term.c_lflag &= ~ICANON;
+        term.c_lflag &= ~ECHO;
+        tcsetattr(STDIN, TCSANOW, &term);
+        initialized = true;
     }
+
+    int bytesWaiting;
+    ioctl(STDIN, FIONREAD, &bytesWaiting);
+    return bytesWaiting;
 }
 
-// Thread to periodically send UDP multicast beacons
-void UDPBeaconSender() {
-    SOCKET udpSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (udpSocket == INVALID_SOCKET) {
-        return;
+int _getch() {
+    char ch;
+    if (read(0, &ch, 1) < 0) return 0;
+    return ch;
+}
+#endif
+
+// Cross-platform Screen Clear using ANSI escape sequences
+void ClearScreen() {
+    std::cout << "\033[2J\033[1;1H" << std::flush;
+}
+
+// Raw C++ HTTP Request client (Supports both IPv4 and IPv6)
+std::string SendHttpRequest(const std::string& method, const std::string& path, const std::string& body) {
+    bool isIPv6 = (g_backendIp.find(':') != std::string::npos);
+    SOCKET sock = socket(isIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        return "";
     }
 
-    sockaddr_in6 multicastAddr = {};
-    multicastAddr.sin6_family = AF_INET6;
-    multicastAddr.sin6_port = htons(DISCOVERY_PORT);
-    inet_pton(AF_INET6, "ff02::1", &multicastAddr.sin6_addr); // Link-local all nodes
+    if (isIPv6) {
+        sockaddr_in6 serverAddr = {};
+        serverAddr.sin6_family = AF_INET6;
+        serverAddr.sin6_port = htons(g_backendPort);
+        if (inet_pton(AF_INET6, g_backendIp.c_str(), &serverAddr.sin6_addr) != 1) {
+            closesocket(sock);
+            return "";
+        }
+        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            closesocket(sock);
+            return "";
+        }
+    } else {
+        sockaddr_in serverAddr = {};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(g_backendPort);
+        if (inet_pton(AF_INET, g_backendIp.c_str(), &serverAddr.sin_addr) != 1) {
+            closesocket(sock);
+            return "";
+        }
+        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            closesocket(sock);
+            return "";
+        }
+    }
 
-    std::string beaconMessage = "TRGGO_PEER:" + std::to_string(g_myTcpPort) + ":" + g_myName + ":" + g_myHostName;
+    std::string hostHeader = g_backendIp;
+    if (isIPv6) {
+        hostHeader = "[" + g_backendIp + "]";
+    }
 
+    std::string request = method + " " + path + " HTTP/1.1\r\n" +
+                          "Host: " + hostHeader + ":" + std::to_string(g_backendPort) + "\r\n" +
+                          "Content-Type: application/json\r\n" +
+                          "Content-Length: " + std::to_string(body.length()) + "\r\n" +
+                          "Connection: close\r\n\r\n" +
+                          body;
+
+    send(sock, request.c_str(), (int)request.length(), 0);
+
+    std::string response = "";
+    char buffer[1024];
+    int bytes;
+    while ((bytes = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes] = '\0';
+        response += buffer;
+    }
+
+    closesocket(sock);
+    return response;
+}
+
+// Thread to periodically send HTTP heartbeats to the tracker
+void HTTPHeartbeatSender() {
+    std::string deviceId = g_myName + "_" + std::to_string(g_myTcpPort);
     while (g_running) {
         if (!g_inChat) {
-            sendto(udpSocket, beaconMessage.c_str(), (int)beaconMessage.length(), 0,
-                   (sockaddr*)&multicastAddr, sizeof(multicastAddr));
+            std::string body = "{"
+                               "\"deviceId\":\"" + deviceId + "\","
+                               "\"hostname\":\"" + g_myHostName + "\","
+                               "\"username\":\"" + g_myName + "\","
+                               "\"localIp\":\"" + std::to_string(g_myTcpPort) + "\""
+                               "}";
+            SendHttpRequest("POST", "/api/heartbeat", body);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
-
-    closesocket(udpSocket);
 }
 
-// Thread to listen for UDP multicast beacons from other peers
-void UDPBeaconListener() {
-    SOCKET udpSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (udpSocket == INVALID_SOCKET) {
-        return;
-    }
-
-    BOOL reuse = TRUE;
-    setsockopt(udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
-
-    sockaddr_in6 bindAddr = {};
-    bindAddr.sin6_family = AF_INET6;
-    bindAddr.sin6_port = htons(DISCOVERY_PORT);
-    bindAddr.sin6_addr = in6addr_any;
-
-    if (bind(udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-        closesocket(udpSocket);
-        return;
-    }
-
-    // Join multicast group ff02::1
-    ipv6_mreq mreq = {};
-    inet_pton(AF_INET6, "ff02::1", &mreq.ipv6mr_multiaddr);
-    mreq.ipv6mr_interface = 0; // OS chooses default interface
-
-    if (setsockopt(udpSocket, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
-        closesocket(udpSocket);
-        return;
-    }
-
-    char recvBuf[512];
+// Thread to periodically fetch online peers from the tracker
+void HTTPPeerFetcher() {
     while (g_running) {
-        sockaddr_in6 senderAddr = {};
-        int senderAddrLen = sizeof(senderAddr);
-        int bytes = recvfrom(udpSocket, recvBuf, sizeof(recvBuf) - 1, 0, (sockaddr*)&senderAddr, &senderAddrLen);
-        if (bytes > 0) {
-            recvBuf[bytes] = '\0';
-            std::string msg(recvBuf);
+        if (!g_inChat) {
+            std::string response = SendHttpRequest("GET", "/api/devices", "");
+            if (!response.empty()) {
+                size_t pos = response.find("\"devices\":[");
+                if (pos != std::string::npos) {
+                    pos += 11;
+                    size_t endPos = response.find("]", pos);
+                    if (endPos != std::string::npos) {
+                        std::string devicesArray = response.substr(pos, endPos - pos);
+                        std::map<std::string, Peer> newPeers;
+                        
+                        size_t objStart = 0;
+                        while ((objStart = devicesArray.find("{", objStart)) != std::string::npos) {
+                            size_t objEnd = devicesArray.find("}", objStart);
+                            if (objEnd == std::string::npos) break;
+                            std::string obj = devicesArray.substr(objStart, objEnd - objStart + 1);
+                            
+                            auto extractField = [](const std::string& json, const std::string& field) -> std::string {
+                                size_t keyPos = json.find("\"" + field + "\":");
+                                if (keyPos == std::string::npos) return "";
+                                keyPos += field.length() + 3;
+                                if (json[keyPos] == '"') {
+                                    size_t valEnd = json.find("\"", keyPos + 1);
+                                    if (valEnd == std::string::npos) return "";
+                                    return json.substr(keyPos + 1, valEnd - keyPos - 1);
+                                } else {
+                                    size_t valEnd = json.find_first_of(",}", keyPos);
+                                    if (valEnd == std::string::npos) return "";
+                                    return json.substr(keyPos, valEnd - keyPos);
+                                }
+                            };
 
-            if (msg.rfind("TRGGO_PEER:", 0) == 0) {
-                size_t firstColon = msg.find(':', 11);
-                if (firstColon != std::string::npos) {
-                    int peerTcpPort = std::stoi(msg.substr(11, firstColon - 11));
-                    
-                    size_t secondColon = msg.find(':', firstColon + 1);
-                    std::string peerName;
-                    std::string peerHostName = "trgGo-Node";
-                    
-                    if (secondColon != std::string::npos) {
-                        peerName = msg.substr(firstColon + 1, secondColon - (firstColon + 1));
-                        peerHostName = msg.substr(secondColon + 1);
-                    } else {
-                        peerName = msg.substr(firstColon + 1);
-                    }
+                            std::string devName = extractField(obj, "username");
+                            std::string devHost = extractField(obj, "hostname");
+                            std::string devIp = extractField(obj, "publicIp");
+                            std::string portStr = extractField(obj, "localIp");
+                            std::string devStatus = extractField(obj, "status");
 
-                    // Skip self
-                    if (peerName == g_myName && peerTcpPort == g_myTcpPort) {
-                        continue;
-                    }
+                            int devPort = portStr.empty() ? 0 : std::stoi(portStr);
 
-                    char ipStr[INET6_ADDRSTRLEN];
-                    inet_ntop(AF_INET6, &senderAddr.sin6_addr, ipStr, INET6_ADDRSTRLEN);
-                    std::string peerIp(ipStr);
+                            // Resolve IPv6 local loopback formats
+                            if (devIp == "::" || devIp == "::ffff:127.0.0.1" || devIp == "127.0.0.1") {
+                                devIp = "::1";
+                            }
 
-                    // Handle local loopback translation if necessary
-                    if (peerIp == "::") {
-                        peerIp = "::1";
-                    }
+                            // Skip ourselves
+                            if (devName == g_myName && devPort == g_myTcpPort) {
+                                objStart = objEnd + 1;
+                                continue;
+                            }
 
-                    std::string key = peerIp + ":" + std::to_string(peerTcpPort);
+                            // Add online devices to active peer map
+                            if (devStatus == "online" && !devName.empty() && devPort > 0) {
+                                Peer p;
+                                p.ip = devIp;
+                                p.port = devPort;
+                                p.name = devName;
+                                p.hostname = devHost;
+                                p.status = devStatus;
+                                p.lastSeen = std::chrono::steady_clock::now();
 
-                    bool isNew = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_peerMutex);
-                        if (g_peers.find(key) == g_peers.end()) {
-                            isNew = true;
+                                std::string key = devIp + ":" + std::to_string(devPort);
+                                newPeers[key] = p;
+                            }
+
+                            objStart = objEnd + 1;
                         }
-                        Peer p;
-                        p.ip = peerIp;
-                        p.port = peerTcpPort;
-                        p.name = peerName;
-                        p.hostname = peerHostName;
-                        p.status = "online";
-                        p.lastSeen = std::chrono::steady_clock::now();
-                        g_peers[key] = p;
-                    }
 
-                    if (isNew) {
-                        g_needRedraw = true;
+                        // Determine if list changed to avoid flickering
+                        bool changed = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_peerMutex);
+                            if (g_peers.size() != newPeers.size()) {
+                                changed = true;
+                            } else {
+                                for (const auto& pair : newPeers) {
+                                    if (g_peers.find(pair.first) == g_peers.end()) {
+                                        changed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            g_peers = newPeers;
+                        }
+
+                        if (changed) {
+                            g_needRedraw = true;
+                        }
                     }
                 }
             }
         }
+        std::this_thread::sleep_for(std::chrono::seconds(3));
     }
-
-    closesocket(udpSocket);
 }
 
 // TCP Chat Server thread to accept incoming chat connections
@@ -219,15 +306,18 @@ void TCPLServer() {
     sockaddr_in6 serverAddr = {};
     serverAddr.sin6_family = AF_INET6;
     serverAddr.sin6_addr = in6addr_any;
-    serverAddr.sin6_port = 0; // Bind to port 0 to let OS select an ephemeral port
+    serverAddr.sin6_port = 0; // Ephemeral port
 
     if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
         closesocket(listenSocket);
         return;
     }
 
-    // Retrieve the port assigned by the OS
-    int addrLen = sizeof(serverAddr);
+    #ifdef _WIN32
+        int addrLen = sizeof(serverAddr);
+    #else
+        socklen_t addrLen = sizeof(serverAddr);
+    #endif
     if (getsockname(listenSocket, (sockaddr*)&serverAddr, &addrLen) == 0) {
         g_myTcpPort = ntohs(serverAddr.sin6_port);
     } else {
@@ -242,17 +332,19 @@ void TCPLServer() {
 
     while (g_running) {
         sockaddr_in6 clientAddr = {};
-        int clientAddrLen = sizeof(clientAddr);
+        #ifdef _WIN32
+            int clientAddrLen = sizeof(clientAddr);
+        #else
+            socklen_t clientAddrLen = sizeof(clientAddr);
+        #endif
         SOCKET clientSocket = accept(listenSocket, (sockaddr*)&clientAddr, &clientAddrLen);
 
         if (clientSocket != INVALID_SOCKET) {
             if (g_inChat) {
-                // Already in a chat, reject the incoming connection
                 closesocket(clientSocket);
             } else {
                 g_chatPartnerName = "Discovered Peer";
                 
-                // Identify peer name from our discovery list if we have it
                 char ipStr[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET6, &clientAddr.sin6_addr, ipStr, INET6_ADDRSTRLEN);
                 std::string clientIp(ipStr);
@@ -284,16 +376,26 @@ void ReceiveMessages(SOCKET peerSocket) {
         int bytesReceived = recv(peerSocket, buffer, BUFFER_SIZE - 1, 0);
         if (bytesReceived > 0) {
             buffer[bytesReceived] = '\0';
-            std::cout << "\r[" << g_chatPartnerName << "]: " << buffer << "\n[You]: " << std::flush;
+            {
+                std::lock_guard<std::mutex> lock(g_chatMutex);
+                g_chatHistory.push_back("[" + g_chatPartnerName + "]: " + std::string(buffer));
+            }
+            g_chatNeedRedraw = true;
         } else if (bytesReceived == 0) {
-            std::cout << "\n[System]: Connection closed by peer.\nPress Enter to return to menu...\n";
+            {
+                std::lock_guard<std::mutex> lock(g_chatMutex);
+                g_chatHistory.push_back("[System]: Connection closed by peer.");
+            }
+            g_chatNeedRedraw = true;
             g_inChat = false;
             break;
         } else {
             int error = WSAGetLastError();
             if (error != WSAEINTR && error != WSAENOTSOCK) {
-                std::cout << "\n[System]: Connection lost (Error: " << error << ").\nPress Enter to return to menu...\n";
+                std::lock_guard<std::mutex> lock(g_chatMutex);
+                g_chatHistory.push_back("[System]: Connection lost (Error: " + std::to_string(error) + ").");
             }
+            g_chatNeedRedraw = true;
             g_inChat = false;
             break;
         }
@@ -301,32 +403,31 @@ void ReceiveMessages(SOCKET peerSocket) {
 }
 
 int main() {
-    // 1. Initialize Winsock
-    WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
-        std::cerr << "WSAStartup failed with error: " << result << "\n";
-        return 1;
-    }
-
-    // Enable ANSI escape sequence processing in Windows Console
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE) {
-        DWORD dwMode = 0;
-        if (GetConsoleMode(hOut, &dwMode)) {
-            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            SetConsoleMode(hOut, dwMode);
+    #ifdef _WIN32
+        WSADATA wsaData;
+        int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+        if (result != 0) {
+            std::cerr << "WSAStartup failed with error: " << result << "\n";
+            return 1;
         }
-    }
 
-    // Retrieve local hostname
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut != INVALID_HANDLE_VALUE) {
+            DWORD dwMode = 0;
+            if (GetConsoleMode(hOut, &dwMode)) {
+                dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                SetConsoleMode(hOut, dwMode);
+            }
+        }
+    #endif
+
     char hostNameBuf[256];
     g_myHostName = "trgGo-Node";
     if (gethostname(hostNameBuf, sizeof(hostNameBuf)) == 0) {
         g_myHostName = hostNameBuf;
     }
 
-    std::system("cls");
+    ClearScreen();
     std::cout << "===========================================\n";
     std::cout << "   trgGo - IPv6 P2P Chat with Discovery    \n";
     std::cout << "===========================================\n";
@@ -336,15 +437,23 @@ int main() {
         g_myName = "AnonymousPeer";
     }
 
+    std::cout << "Enter Tracker IP (default 127.0.0.1): ";
+    std::string ipInput;
+    std::getline(std::cin, ipInput);
+    g_backendIp = ipInput.empty() ? "127.0.0.1" : ipInput;
+
+    std::cout << "Enter Tracker Port (default 8000): ";
+    std::string portInput;
+    std::getline(std::cin, portInput);
+    g_backendPort = portInput.empty() ? 8000 : std::stoi(portInput);
+
     // 2. Start TCP Chat Server (assigns ephemeral port)
     std::thread tcpServerThread(TCPLServer);
-    // Wait briefly to make sure port is assigned
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // 3. Start UDP Multicast Beacon Sender & Listener
-    std::thread beaconSenderThread(UDPBeaconSender);
-    std::thread beaconListenerThread(UDPBeaconListener);
-    std::thread pruningThread(PruneOfflinePeers);
+    // 3. Start HTTP Heartbeat Sender & online peer fetcher
+    std::thread heartbeatThread(HTTPHeartbeatSender);
+    std::thread fetcherThread(HTTPPeerFetcher);
 
     std::vector<Peer> activePeersList;
     std::string currentInput = "";
@@ -359,24 +468,30 @@ int main() {
                   << std::string(W_STAT + 2, '-') << "+\n";
     };
 
+    auto print_separator = [&]() {
+        std::cout << "  " << std::string(W_ID + W_NAME + W_USER + W_IP + W_STAT + 17, '=') << "\n";
+    };
+
+    auto print_dash_separator = [&]() {
+        std::cout << "  " << std::string(W_ID + W_NAME + W_USER + W_IP + W_STAT + 17, '-') << "\n";
+    };
+
     while (g_running) {
-        // Instant check if someone connected to us
         if (g_inChat && g_chatSocket != INVALID_SOCKET) {
             goto enter_chat_room;
         }
 
         if (g_needRedraw) {
             g_needRedraw = false;
-            std::system("cls");
+            ClearScreen();
 
-            std::cout << "==================================================================================\n";
-            std::cout << " " << color::CYAN << color::BOLD << "trgGo P2P Console" << color::RESET 
+            print_separator();
+            std::cout << "  " << color::CYAN << color::BOLD << "trgGo P2P Console" << color::RESET 
                       << " | User: " << color::GREEN << g_myName << color::RESET 
                       << " | Host: " << g_myHostName 
                       << " | Port: " << g_myTcpPort << "\n";
-            std::cout << "==================================================================================\n";
+            print_separator();
 
-            // Print table header using user-supplied style
             hline();
             std::cout << color::BOLD << color::CYAN
                       << "  | " << std::setw(W_ID)   << std::left << "ID"
@@ -414,25 +529,23 @@ int main() {
 
             std::cout << "\nCommands: engage <id>, initiate <id>, use <id>, or raw <id>\n";
             std::cout << "Type /exit to quit.\n";
-            std::cout << "----------------------------------------------------------------------------------\n";
+            print_dash_separator();
             std::cout << "> " << currentInput << std::flush;
         }
 
-        // Non-blocking keyboard check using conio
         if (_kbhit()) {
             int ch = _getch();
             if (ch == 224 || ch == 0) {
-                // Extended character (ignore arrow keys)
                 _getch();
                 continue;
             }
 
-            if (ch == 8) { // Backspace
+            if (ch == 8 || ch == 127) { // Backspace
                 if (!currentInput.empty()) {
                     currentInput.pop_back();
                     std::cout << "\b \b" << std::flush;
                 }
-            } else if (ch == 13) { // Enter
+            } else if (ch == 13 || ch == 10) { // Enter
                 std::cout << "\n";
                 std::string cmd = currentInput;
                 currentInput = "";
@@ -442,7 +555,6 @@ int main() {
                     break;
                 }
 
-                // Parse input command formats
                 std::string targetIdStr = "";
                 if (cmd.rfind("engage ", 0) == 0 && cmd.length() > 7) {
                     targetIdStr = cmd.substr(7);
@@ -451,10 +563,9 @@ int main() {
                 } else if (cmd.rfind("use ", 0) == 0 && cmd.length() > 4) {
                     targetIdStr = cmd.substr(4);
                 } else {
-                    targetIdStr = cmd; // direct number
+                    targetIdStr = cmd;
                 }
 
-                // Clean spaces
                 while (!targetIdStr.empty() && targetIdStr.front() == ' ') targetIdStr.erase(0, 1);
                 while (!targetIdStr.empty() && targetIdStr.back() == ' ') targetIdStr.pop_back();
 
@@ -465,14 +576,31 @@ int main() {
                             Peer target = activePeersList[selection - 1];
                             std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
 
-                            SOCKET connectSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+                            // Determine if connecting IP is IPv6 or IPv4
+                            bool isTargetIPv6 = (target.ip.find(':') != std::string::npos);
+                            SOCKET connectSocket = socket(isTargetIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                            
                             if (connectSocket != INVALID_SOCKET) {
-                                sockaddr_in6 peerAddr = {};
-                                peerAddr.sin6_family = AF_INET6;
-                                peerAddr.sin6_port = htons(target.port);
-                                inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
+                                bool connected = false;
+                                if (isTargetIPv6) {
+                                    sockaddr_in6 peerAddr = {};
+                                    peerAddr.sin6_family = AF_INET6;
+                                    peerAddr.sin6_port = htons(target.port);
+                                    inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
+                                    if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                        connected = true;
+                                    }
+                                } else {
+                                    sockaddr_in peerAddr = {};
+                                    peerAddr.sin_family = AF_INET;
+                                    peerAddr.sin_port = htons(target.port);
+                                    inet_pton(AF_INET, target.ip.c_str(), &peerAddr.sin_addr);
+                                    if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                        connected = true;
+                                    }
+                                }
 
-                                if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                if (connected) {
                                     g_chatPartnerName = target.name;
                                     g_chatSocket = connectSocket;
                                     g_inChat = true;
@@ -496,7 +624,7 @@ int main() {
                 } else {
                     g_needRedraw = true;
                 }
-            } else if (ch >= 32 && ch <= 126) { // ASCII printable
+            } else if (ch >= 32 && ch <= 126) {
                 currentInput += (char)ch;
                 std::cout << (char)ch << std::flush;
             }
@@ -506,36 +634,84 @@ int main() {
 
     enter_chat_room:
         if (g_inChat && g_chatSocket != INVALID_SOCKET) {
-            std::system("cls");
-
-            std::cout << "===========================================\n";
-            std::cout << " Chatting with: " << g_chatPartnerName << "\n";
-            std::cout << " Type /exit to close the session.\n";
-            std::cout << "===========================================\n\n";
+            {
+                std::lock_guard<std::mutex> lock(g_chatMutex);
+                g_chatHistory.clear();
+            }
+            g_chatNeedRedraw = true;
+            std::string currentChatInput = "";
 
             std::thread recvThread(ReceiveMessages, g_chatSocket.load());
 
             while (g_inChat && g_running) {
-                std::cout << "[You]: " << std::flush;
-                std::string chatInput;
-                std::getline(std::cin, chatInput);
+                if (g_chatNeedRedraw) {
+                    g_chatNeedRedraw = false;
+                    ClearScreen();
 
-                if (chatInput == "/exit") {
-                    g_inChat = false;
-                    break;
+                    print_separator();
+                    std::cout << "  " << color::CYAN << color::BOLD << "LIVE P2P CHAT SESSION" << color::RESET 
+                              << " | Peer: " << color::GREEN << color::BOLD << g_chatPartnerName << color::RESET 
+                              << " | Connection: " << color::GREEN << "Established" << color::RESET << "\n";
+                    std::cout << "  " << "Instruction: Type messages below and press Enter. Send " << color::RED << "/exit" << color::RESET << " to disconnect.\n";
+                    print_separator();
+                    std::cout << "\n";
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_chatMutex);
+                        for (const auto& line : g_chatHistory) {
+                            std::cout << line << "\n";
+                        }
+                    }
+                    std::cout << "[You]: " << currentChatInput << std::flush;
                 }
 
-                if (!chatInput.empty() && g_inChat) {
-                    int bytesSent = send(g_chatSocket, chatInput.c_str(), (int)chatInput.length(), 0);
-                    if (bytesSent == SOCKET_ERROR) {
-                        std::cerr << "\n[System]: Send failed. Error: " << WSAGetLastError() << "\n";
-                        g_inChat = false;
-                        break;
+                if (_kbhit()) {
+                    int ch = _getch();
+                    if (ch == 224 || ch == 0) {
+                        _getch();
+                        continue;
                     }
+
+                    if (ch == 8 || ch == 127) { // Backspace
+                        if (!currentChatInput.empty()) {
+                            currentChatInput.pop_back();
+                            std::cout << "\b \b" << std::flush;
+                        }
+                    } else if (ch == 13 || ch == 10) { // Enter
+                        std::cout << "\n";
+                        std::string msg = currentChatInput;
+                        currentChatInput = "";
+
+                        if (msg == "/exit") {
+                            g_inChat = false;
+                            break;
+                        }
+
+                        if (!msg.empty()) {
+                            int bytesSent = send(g_chatSocket, msg.c_str(), (int)msg.length(), 0);
+                            if (bytesSent == SOCKET_ERROR) {
+                                std::lock_guard<std::mutex> lock(g_chatMutex);
+                                g_chatHistory.push_back("[System]: Send failed. Error: " + std::to_string(WSAGetLastError()));
+                                g_inChat = false;
+                                break;
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(g_chatMutex);
+                                g_chatHistory.push_back("[You]: " + msg);
+                            }
+                            g_chatNeedRedraw = true;
+                        } else {
+                            g_chatNeedRedraw = true;
+                        }
+                    } else if (ch >= 32 && ch <= 126) {
+                        currentChatInput += (char)ch;
+                        std::cout << (char)ch << std::flush;
+                    }
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
 
-            // Chat session cleanup
             shutdown(g_chatSocket, SD_BOTH);
             closesocket(g_chatSocket);
             g_chatSocket = INVALID_SOCKET;
@@ -546,12 +722,11 @@ int main() {
             }
 
             std::cout << "\n[System]: Returning to online peer list...\n";
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
             g_needRedraw = true;
         }
     }
 
-    // Full cleanup
     g_running = false;
     
     SOCKET cs = g_chatSocket.exchange(INVALID_SOCKET);
@@ -560,11 +735,12 @@ int main() {
     }
 
     if (tcpServerThread.joinable()) tcpServerThread.join();
-    if (beaconSenderThread.joinable()) beaconSenderThread.join();
-    if (beaconListenerThread.joinable()) beaconListenerThread.join();
-    if (pruningThread.joinable()) pruningThread.join();
+    if (heartbeatThread.joinable()) heartbeatThread.join();
+    if (fetcherThread.joinable()) fetcherThread.join();
 
-    WSACleanup();
+    #ifdef _WIN32
+        WSACleanup();
+    #endif
     std::cout << "[System]: Closed. Goodbye!\n";
     return 0;
 }
