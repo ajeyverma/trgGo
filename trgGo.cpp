@@ -59,7 +59,8 @@ const int W_IP   = 48;
 const int W_STAT = 8;
 
 struct Peer {
-    std::string ip;
+    std::string ip;         // Public IP
+    std::string localIp;    // Local LAN IP
     int port;
     std::string name;       // User
     std::string hostname;   // Name (Host)
@@ -115,6 +116,42 @@ void ClearScreen() {
     std::cout << "\033[2J\033[1;1H" << std::flush;
 }
 
+// Retrieves the device's local LAN IP address
+std::string GetLocalIpAddress() {
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0) {
+        return "127.0.0.1";
+    }
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0) {
+        return "127.0.0.1";
+    }
+    std::string ip = "127.0.0.1";
+    char ipStr[INET6_ADDRSTRLEN];
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        if (p->ai_family == AF_INET6) {
+            sockaddr_in6* ipv6 = (sockaddr_in6*)p->ai_addr;
+            inet_ntop(AF_INET6, &ipv6->sin6_addr, ipStr, INET6_ADDRSTRLEN);
+            std::string temp(ipStr);
+            if (temp != "::1" && temp != "::" && temp.rfind("fe80", 0) != 0) {
+                ip = temp;
+                break;
+            }
+        } else if (p->ai_family == AF_INET) {
+            sockaddr_in* ipv4 = (sockaddr_in*)p->ai_addr;
+            inet_ntop(AF_INET, &ipv4->sin_addr, ipStr, INET_ADDRSTRLEN);
+            std::string temp(ipStr);
+            if (temp != "127.0.0.1" && temp.rfind("169.254", 0) != 0) {
+                ip = temp;
+            }
+        }
+    }
+    freeaddrinfo(res);
+    return ip;
+}
+
 // Executes a shell command and captures stdout
 std::string ExecuteCommand(const std::string& cmd) {
     std::string result = "";
@@ -143,7 +180,6 @@ std::string SendHttpRequest(const std::string& method, const std::string& path, 
     
     if (!body.empty()) {
 #ifdef _WIN32
-        // Escape quotes for Windows cmd shell
         std::string escapedBody = "";
         for (char c : body) {
             if (c == '"') escapedBody += "\\\"";
@@ -162,11 +198,12 @@ void HTTPHeartbeatSender() {
     std::string deviceId = g_myName + "_" + std::to_string(g_myTcpPort);
     while (g_running) {
         if (!g_inChat) {
+            std::string myLocalIp = GetLocalIpAddress();
             std::string body = "{"
                                "\"deviceId\":\"" + deviceId + "\","
                                "\"hostname\":\"" + g_myHostName + "\","
                                "\"username\":\"" + g_myName + "\","
-                               "\"localIp\":\"" + std::to_string(g_myTcpPort) + "\""
+                               "\"localIp\":\"" + myLocalIp + ":" + std::to_string(g_myTcpPort) + "\""
                                "}";
             SendHttpRequest("POST", "/api/heartbeat", body);
         }
@@ -211,20 +248,31 @@ void HTTPPeerFetcher() {
                             std::string devName = extractField(obj, "username");
                             std::string devHost = extractField(obj, "hostname");
                             std::string devIp = extractField(obj, "publicIp");
-                            std::string portStr = extractField(obj, "localIp");
+                            std::string localIpField = extractField(obj, "localIp");
                             std::string devStatus = extractField(obj, "status");
 
-                            int devPort = portStr.empty() ? 0 : std::stoi(portStr);
+                            // Parse port and local IP from localIpField (Format: "IP:Port")
+                            std::string devLocalIp = "127.0.0.1";
+                            int devPort = 0;
+                            size_t lastColon = localIpField.rfind(':');
+                            if (lastColon != std::string::npos) {
+                                devLocalIp = localIpField.substr(0, lastColon);
+                                devPort = std::stoi(localIpField.substr(lastColon + 1));
+                            } else {
+                                devPort = localIpField.empty() ? 0 : std::stoi(localIpField);
+                            }
 
-                            // Resolve IPv6 local loopback formats
                             if (devIp == "::" || devIp == "::ffff:127.0.0.1" || devIp == "127.0.0.1" || devIp == "::1") {
-                                // Default to loopback address format
                                 devIp = "::1";
+                            }
+                            if (devLocalIp == "::" || devLocalIp == "::ffff:127.0.0.1" || devLocalIp == "127.0.0.1" || devLocalIp == "::1") {
+                                devLocalIp = "::1";
                             }
 
                             if (devStatus == "online" && !devName.empty() && devPort > 0) {
                                 Peer p;
                                 p.ip = devIp;
+                                p.localIp = devLocalIp;
                                 p.port = devPort;
                                 p.name = devName;
                                 p.hostname = devHost;
@@ -321,7 +369,7 @@ void TCPLServer() {
                 {
                     std::lock_guard<std::mutex> lock(g_peerMutex);
                     for (const auto& pair : g_peers) {
-                        if (pair.second.ip == clientIp) {
+                        if (pair.second.ip == clientIp || pair.second.localIp == clientIp) {
                             g_chatPartnerName = pair.second.name;
                             break;
                         }
@@ -369,6 +417,75 @@ void ReceiveMessages(SOCKET peerSocket) {
     }
 }
 
+// Unified client connection helper (Tries LAN, falls back to WAN)
+SOCKET TryP2PConnect(const Peer& target) {
+    // 1. Try Local LAN IP Connection first
+    bool isLocalIPv6 = (target.localIp.find(':') != std::string::npos);
+    std::cout << "[System]: Trying LAN connection to [" << target.localIp << "]:" << target.port << "...\n";
+    SOCKET sock = socket(isLocalIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    
+    if (sock != INVALID_SOCKET) {
+        bool connected = false;
+        if (isLocalIPv6) {
+            sockaddr_in6 addr = {};
+            addr.sin6_family = AF_INET6;
+            addr.sin6_port = htons(target.port);
+            inet_pton(AF_INET6, target.localIp.c_str(), &addr.sin6_addr);
+            if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                connected = true;
+            }
+        } else {
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(target.port);
+            inet_pton(AF_INET, target.localIp.c_str(), &addr.sin_addr);
+            if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                connected = true;
+            }
+        }
+
+        if (connected) {
+            std::cout << "[System]: LAN connection successful!\n";
+            return sock;
+        }
+        closesocket(sock);
+    }
+
+    // 2. Fall back to Public WAN IP Connection
+    bool isPublicIPv6 = (target.ip.find(':') != std::string::npos);
+    std::cout << "[System]: LAN failed. Trying WAN connection to [" << target.ip << "]:" << target.port << "...\n";
+    sock = socket(isPublicIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    
+    if (sock != INVALID_SOCKET) {
+        bool connected = false;
+        if (isPublicIPv6) {
+            sockaddr_in6 addr = {};
+            addr.sin6_family = AF_INET6;
+            addr.sin6_port = htons(target.port);
+            inet_pton(AF_INET6, target.ip.c_str(), &addr.sin6_addr);
+            if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                connected = true;
+            }
+        } else {
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(target.port);
+            inet_pton(AF_INET, target.ip.c_str(), &addr.sin_addr);
+            if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                connected = true;
+            }
+        }
+
+        if (connected) {
+            std::cout << "[System]: WAN connection successful!\n";
+            return sock;
+        }
+        closesocket(sock);
+    }
+
+    return INVALID_SOCKET;
+}
+
 int main() {
     #ifdef _WIN32
         WSADATA wsaData;
@@ -411,11 +528,9 @@ int main() {
         g_backendUrl = urlInput;
     }
 
-    // Auto prepend https:// if protocol is omitted
     if (g_backendUrl.rfind("http", 0) != 0) {
         g_backendUrl = "https://" + g_backendUrl;
     }
-    // Trim trailing slash
     if (!g_backendUrl.empty() && g_backendUrl.back() == '/') {
         g_backendUrl.pop_back();
     }
@@ -549,41 +664,15 @@ int main() {
                                 std::this_thread::sleep_for(std::chrono::seconds(2));
                                 g_needRedraw = true;
                             } else {
-                                std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
-
-                                bool isTargetIPv6 = (target.ip.find(':') != std::string::npos);
-                                SOCKET connectSocket = socket(isTargetIPv6 ? AF_INET6 : AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                                
+                                SOCKET connectSocket = TryP2PConnect(target);
                                 if (connectSocket != INVALID_SOCKET) {
-                                    bool connected = false;
-                                    if (isTargetIPv6) {
-                                        sockaddr_in6 peerAddr = {};
-                                        peerAddr.sin6_family = AF_INET6;
-                                        peerAddr.sin6_port = htons(target.port);
-                                        inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
-                                        if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
-                                            connected = true;
-                                        }
-                                    } else {
-                                        sockaddr_in peerAddr = {};
-                                        peerAddr.sin_family = AF_INET;
-                                        peerAddr.sin_port = htons(target.port);
-                                        inet_pton(AF_INET, target.ip.c_str(), &peerAddr.sin_addr);
-                                        if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
-                                            connected = true;
-                                        }
-                                    }
-
-                                    if (connected) {
-                                        g_chatPartnerName = target.name;
-                                        g_chatSocket = connectSocket;
-                                        g_inChat = true;
-                                    } else {
-                                        std::cerr << "[System]: Connection failed. Error: " << WSAGetLastError() << "\n";
-                                        closesocket(connectSocket);
-                                        std::this_thread::sleep_for(std::chrono::seconds(2));
-                                        g_needRedraw = true;
-                                    }
+                                    g_chatPartnerName = target.name;
+                                    g_chatSocket = connectSocket;
+                                    g_inChat = true;
+                                } else {
+                                    std::cerr << color::RED << "[System]: Connection failed to both LAN and WAN addresses." << color::RESET << "\n";
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                    g_needRedraw = true;
                                 }
                             }
                         } else {
