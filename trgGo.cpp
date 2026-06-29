@@ -12,6 +12,8 @@
 #include <mutex>
 #include <chrono>
 #include <atomic>
+#include <iomanip>
+#include <conio.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <ws2ipdef.h>
@@ -21,10 +23,28 @@
 #define DISCOVERY_PORT 9999
 #define BUFFER_SIZE 2048
 
+// Color namespace for beautiful terminal styling
+namespace color {
+    const char* RESET   = "\033[0m";
+    const char* BOLD    = "\033[1m";
+    const char* CYAN    = "\033[36m";
+    const char* GREEN   = "\033[32m";
+    const char* RED     = "\033[31m";
+}
+
+// Column widths for the device table
+const int W_ID   = 4;
+const int W_NAME = 16;
+const int W_USER = 16;
+const int W_IP   = 22;
+const int W_STAT = 8;
+
 struct Peer {
     std::string ip;
     int port;
-    std::string name;
+    std::string name;       // User
+    std::string hostname;   // Name (Host)
+    std::string status;     // "online" or "offline"
     std::chrono::steady_clock::time_point lastSeen;
 };
 
@@ -34,22 +54,34 @@ std::mutex g_peerMutex;
 std::atomic<bool> g_running(true);
 std::atomic<SOCKET> g_chatSocket(INVALID_SOCKET);
 std::atomic<bool> g_inChat(false);
+std::atomic<bool> g_needRedraw(true);
 std::string g_myName;
+std::string g_myHostName;
+std::string g_chatPartnerName = "Peer";
 int g_myTcpPort = 0;
 
 // Prune peers that haven't sent a beacon in 6 seconds
 void PruneOfflinePeers() {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (g_inChat) continue;
+
         auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(g_peerMutex);
-        for (auto it = g_peers.begin(); it != g_peers.end(); ) {
-            auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastSeen).count();
-            if (duration > 6) {
-                it = g_peers.erase(it);
-            } else {
-                ++it;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_peerMutex);
+            for (auto it = g_peers.begin(); it != g_peers.end(); ) {
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastSeen).count();
+                if (duration > 6) {
+                    it = g_peers.erase(it);
+                    changed = true;
+                } else {
+                    ++it;
+                }
             }
+        }
+        if (changed) {
+            g_needRedraw = true;
         }
     }
 }
@@ -66,7 +98,7 @@ void UDPBeaconSender() {
     multicastAddr.sin6_port = htons(DISCOVERY_PORT);
     inet_pton(AF_INET6, "ff02::1", &multicastAddr.sin6_addr); // Link-local all nodes
 
-    std::string beaconMessage = "TRGGO_PEER:" + std::to_string(g_myTcpPort) + ":" + g_myName;
+    std::string beaconMessage = "TRGGO_PEER:" + std::to_string(g_myTcpPort) + ":" + g_myName + ":" + g_myHostName;
 
     while (g_running) {
         if (!g_inChat) {
@@ -122,7 +154,17 @@ void UDPBeaconListener() {
                 size_t firstColon = msg.find(':', 11);
                 if (firstColon != std::string::npos) {
                     int peerTcpPort = std::stoi(msg.substr(11, firstColon - 11));
-                    std::string peerName = msg.substr(firstColon + 1);
+                    
+                    size_t secondColon = msg.find(':', firstColon + 1);
+                    std::string peerName;
+                    std::string peerHostName = "trgGo-Node";
+                    
+                    if (secondColon != std::string::npos) {
+                        peerName = msg.substr(firstColon + 1, secondColon - (firstColon + 1));
+                        peerHostName = msg.substr(secondColon + 1);
+                    } else {
+                        peerName = msg.substr(firstColon + 1);
+                    }
 
                     // Skip self
                     if (peerName == g_myName && peerTcpPort == g_myTcpPort) {
@@ -140,13 +182,25 @@ void UDPBeaconListener() {
 
                     std::string key = peerIp + ":" + std::to_string(peerTcpPort);
 
-                    std::lock_guard<std::mutex> lock(g_peerMutex);
-                    Peer p;
-                    p.ip = peerIp;
-                    p.port = peerTcpPort;
-                    p.name = peerName;
-                    p.lastSeen = std::chrono::steady_clock::now();
-                    g_peers[key] = p;
+                    bool isNew = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_peerMutex);
+                        if (g_peers.find(key) == g_peers.end()) {
+                            isNew = true;
+                        }
+                        Peer p;
+                        p.ip = peerIp;
+                        p.port = peerTcpPort;
+                        p.name = peerName;
+                        p.hostname = peerHostName;
+                        p.status = "online";
+                        p.lastSeen = std::chrono::steady_clock::now();
+                        g_peers[key] = p;
+                    }
+
+                    if (isNew) {
+                        g_needRedraw = true;
+                    }
                 }
             }
         }
@@ -196,9 +250,26 @@ void TCPLServer() {
                 // Already in a chat, reject the incoming connection
                 closesocket(clientSocket);
             } else {
+                g_chatPartnerName = "Discovered Peer";
+                
+                // Identify peer name from our discovery list if we have it
+                char ipStr[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &clientAddr.sin6_addr, ipStr, INET6_ADDRSTRLEN);
+                std::string clientIp(ipStr);
+                if (clientIp == "::") clientIp = "::1";
+
+                {
+                    std::lock_guard<std::mutex> lock(g_peerMutex);
+                    for (const auto& pair : g_peers) {
+                        if (pair.second.ip == clientIp) {
+                            g_chatPartnerName = pair.second.name;
+                            break;
+                        }
+                    }
+                }
+
                 g_chatSocket = clientSocket;
                 g_inChat = true;
-                std::cout << "\n[System]: Incoming connection accepted! Press ENTER to start chatting...\n";
             }
         }
     }
@@ -213,7 +284,7 @@ void ReceiveMessages(SOCKET peerSocket) {
         int bytesReceived = recv(peerSocket, buffer, BUFFER_SIZE - 1, 0);
         if (bytesReceived > 0) {
             buffer[bytesReceived] = '\0';
-            std::cout << "\r[Peer]: " << buffer << "\n[You]: " << std::flush;
+            std::cout << "\r[" << g_chatPartnerName << "]: " << buffer << "\n[You]: " << std::flush;
         } else if (bytesReceived == 0) {
             std::cout << "\n[System]: Connection closed by peer.\nPress Enter to return to menu...\n";
             g_inChat = false;
@@ -229,32 +300,6 @@ void ReceiveMessages(SOCKET peerSocket) {
     }
 }
 
-// Renders the online peers in the console
-void PrintOnlinePeers(std::vector<Peer>& activePeersList) {
-    std::cout << "\n===========================================\n";
-    std::cout << " Your Name: " << g_myName << " (Listening on port " << g_myTcpPort << ")\n";
-    std::cout << "===========================================\n";
-    std::cout << "Online Users:\n";
-
-    std::lock_guard<std::mutex> lock(g_peerMutex);
-    activePeersList.clear();
-    int idx = 1;
-    for (const auto& pair : g_peers) {
-        activePeersList.push_back(pair.second);
-        std::cout << "  [" << idx++ << "] " << pair.second.name << " (" << pair.second.ip << ":" << pair.second.port << ")\n";
-    }
-
-    if (g_peers.empty()) {
-        std::cout << "  (No peers online yet. Searching...)\n";
-    }
-
-    std::cout << "-------------------------------------------\n";
-    std::cout << "Type a peer number [1-" << g_peers.size() << "] to connect,\n";
-    std::cout << "Type /refresh to refresh the peer list,\n";
-    std::cout << "Type /exit to quit.\n";
-    std::cout << "-------------------------------------------\n";
-}
-
 int main() {
     // 1. Initialize Winsock
     WSADATA wsaData;
@@ -264,6 +309,24 @@ int main() {
         return 1;
     }
 
+    // Enable ANSI escape sequence processing in Windows Console
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        if (GetConsoleMode(hOut, &dwMode)) {
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            SetConsoleMode(hOut, dwMode);
+        }
+    }
+
+    // Retrieve local hostname
+    char hostNameBuf[256];
+    g_myHostName = "trgGo-Node";
+    if (gethostname(hostNameBuf, sizeof(hostNameBuf)) == 0) {
+        g_myHostName = hostNameBuf;
+    }
+
+    std::system("cls");
     std::cout << "===========================================\n";
     std::cout << "   trgGo - IPv6 P2P Chat with Discovery    \n";
     std::cout << "===========================================\n";
@@ -284,68 +347,171 @@ int main() {
     std::thread pruningThread(PruneOfflinePeers);
 
     std::vector<Peer> activePeersList;
+    std::string currentInput = "";
+
+    // Helper lambda to draw table line
+    auto hline = [&]() {
+        std::cout << "  +"
+                  << std::string(W_ID   + 2, '-') << "+"
+                  << std::string(W_NAME + 2, '-') << "+"
+                  << std::string(W_USER + 2, '-') << "+"
+                  << std::string(W_IP   + 2, '-') << "+"
+                  << std::string(W_STAT + 2, '-') << "+\n";
+    };
 
     while (g_running) {
-        PrintOnlinePeers(activePeersList);
-        std::cout << "> " << std::flush;
-
-        std::string input;
-        std::getline(std::cin, input);
-
-        if (input == "/exit") {
-            g_running = false;
-            break;
-        }
-
-        if (input == "/refresh" || input.empty()) {
-            // Check if we were connected to while waiting
-            if (g_inChat && g_chatSocket != INVALID_SOCKET) {
-                // Transition into chat room loop
-                goto enter_chat_room;
-            }
-            continue;
-        }
-
-        // Check if we got connected to while typing
+        // Instant check if someone connected to us
         if (g_inChat && g_chatSocket != INVALID_SOCKET) {
             goto enter_chat_room;
         }
 
-        // Try parsing selection
-        try {
-            int selection = std::stoi(input);
-            if (selection >= 1 && selection <= (int)activePeersList.size()) {
-                Peer target = activePeersList[selection - 1];
-                std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
+        if (g_needRedraw) {
+            g_needRedraw = false;
+            std::system("cls");
 
-                SOCKET connectSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-                if (connectSocket != INVALID_SOCKET) {
-                    sockaddr_in6 peerAddr = {};
-                    peerAddr.sin6_family = AF_INET6;
-                    peerAddr.sin6_port = htons(target.port);
-                    inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
+            std::cout << "==================================================================================\n";
+            std::cout << " " << color::CYAN << color::BOLD << "trgGo P2P Console" << color::RESET 
+                      << " | User: " << color::GREEN << g_myName << color::RESET 
+                      << " | Host: " << g_myHostName 
+                      << " | Port: " << g_myTcpPort << "\n";
+            std::cout << "==================================================================================\n";
 
-                    if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
-                        g_chatSocket = connectSocket;
-                        g_inChat = true;
-                        std::cout << "[System]: Connected to peer!\n";
-                    } else {
-                        std::cerr << "[System]: Failed to connect to peer. Error: " << WSAGetLastError() << "\n";
-                        closesocket(connectSocket);
-                    }
+            // Print table header using user-supplied style
+            hline();
+            std::cout << color::BOLD << color::CYAN
+                      << "  | " << std::setw(W_ID)   << std::left << "ID"
+                      << " | " << std::setw(W_NAME) << std::left << "Name (Host)"
+                      << " | " << std::setw(W_USER) << std::left << "User"
+                      << " | " << std::setw(W_IP)   << std::left << "Public IP"
+                      << " | " << std::setw(W_STAT) << std::left << "Status"
+                      << " |" << color::RESET << "\n";
+            hline();
+
+            activePeersList.clear();
+            {
+                std::lock_guard<std::mutex> lock(g_peerMutex);
+                int idx = 1;
+                for (const auto& pair : g_peers) {
+                    activePeersList.push_back(pair.second);
+                    
+                    const char* sc = (pair.second.status == "online") ? color::GREEN : color::RED;
+                    std::string displayIp = pair.second.ip + ":" + std::to_string(pair.second.port);
+
+                    std::cout << "  | " << color::BOLD << std::setw(W_ID) << std::left << idx++ << color::RESET
+                              << " | " << std::setw(W_NAME) << std::left << pair.second.hostname
+                              << " | " << std::setw(W_USER) << std::left << pair.second.name
+                              << " | " << std::setw(W_IP)   << std::left << displayIp
+                              << " | " << sc << std::setw(W_STAT) << std::left << pair.second.status << color::RESET
+                              << " |\n";
                 }
-            } else {
-                std::cout << "[System]: Invalid peer number.\n";
             }
-        } catch (...) {
-            std::cout << "[System]: Unknown command or invalid selection.\n";
+
+            if (activePeersList.empty()) {
+                std::cout << "  | " << std::setw(W_ID + W_NAME + W_USER + W_IP + W_STAT + 12) << std::left 
+                          << "   No devices online yet. Searching..." << " |\n";
+            }
+            hline();
+
+            std::cout << "\nCommands: engage <id>, initiate <id>, use <id>, or raw <id>\n";
+            std::cout << "Type /exit to quit.\n";
+            std::cout << "----------------------------------------------------------------------------------\n";
+            std::cout << "> " << currentInput << std::flush;
+        }
+
+        // Non-blocking keyboard check using conio
+        if (_kbhit()) {
+            int ch = _getch();
+            if (ch == 224 || ch == 0) {
+                // Extended character (ignore arrow keys)
+                _getch();
+                continue;
+            }
+
+            if (ch == 8) { // Backspace
+                if (!currentInput.empty()) {
+                    currentInput.pop_back();
+                    std::cout << "\b \b" << std::flush;
+                }
+            } else if (ch == 13) { // Enter
+                std::cout << "\n";
+                std::string cmd = currentInput;
+                currentInput = "";
+
+                if (cmd == "/exit") {
+                    g_running = false;
+                    break;
+                }
+
+                // Parse input command formats
+                std::string targetIdStr = "";
+                if (cmd.rfind("engage ", 0) == 0 && cmd.length() > 7) {
+                    targetIdStr = cmd.substr(7);
+                } else if (cmd.rfind("initiate ", 0) == 0 && cmd.length() > 9) {
+                    targetIdStr = cmd.substr(9);
+                } else if (cmd.rfind("use ", 0) == 0 && cmd.length() > 4) {
+                    targetIdStr = cmd.substr(4);
+                } else {
+                    targetIdStr = cmd; // direct number
+                }
+
+                // Clean spaces
+                while (!targetIdStr.empty() && targetIdStr.front() == ' ') targetIdStr.erase(0, 1);
+                while (!targetIdStr.empty() && targetIdStr.back() == ' ') targetIdStr.pop_back();
+
+                if (!targetIdStr.empty()) {
+                    try {
+                        int selection = std::stoi(targetIdStr);
+                        if (selection >= 1 && selection <= (int)activePeersList.size()) {
+                            Peer target = activePeersList[selection - 1];
+                            std::cout << "[System]: Connecting to " << target.name << " at [" << target.ip << "]:" << target.port << "...\n";
+
+                            SOCKET connectSocket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+                            if (connectSocket != INVALID_SOCKET) {
+                                sockaddr_in6 peerAddr = {};
+                                peerAddr.sin6_family = AF_INET6;
+                                peerAddr.sin6_port = htons(target.port);
+                                inet_pton(AF_INET6, target.ip.c_str(), &peerAddr.sin6_addr);
+
+                                if (connect(connectSocket, (sockaddr*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR) {
+                                    g_chatPartnerName = target.name;
+                                    g_chatSocket = connectSocket;
+                                    g_inChat = true;
+                                } else {
+                                    std::cerr << "[System]: Connection failed. Error: " << WSAGetLastError() << "\n";
+                                    closesocket(connectSocket);
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                    g_needRedraw = true;
+                                }
+                            }
+                        } else {
+                            std::cout << "[System]: Invalid peer number.\n";
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            g_needRedraw = true;
+                        }
+                    } catch (...) {
+                        std::cout << "[System]: Unknown command or invalid selection.\n";
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        g_needRedraw = true;
+                    }
+                } else {
+                    g_needRedraw = true;
+                }
+            } else if (ch >= 32 && ch <= 126) { // ASCII printable
+                currentInput += (char)ch;
+                std::cout << (char)ch << std::flush;
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
     enter_chat_room:
         if (g_inChat && g_chatSocket != INVALID_SOCKET) {
-            std::cout << "\n-------------------------------------------\n";
-            std::cout << " Chat session started. Type /exit to close.\n";
-            std::cout << "-------------------------------------------\n\n";
+            std::system("cls");
+
+            std::cout << "===========================================\n";
+            std::cout << " Chatting with: " << g_chatPartnerName << "\n";
+            std::cout << " Type /exit to close the session.\n";
+            std::cout << "===========================================\n\n";
 
             std::thread recvThread(ReceiveMessages, g_chatSocket.load());
 
@@ -362,7 +528,7 @@ int main() {
                 if (!chatInput.empty() && g_inChat) {
                     int bytesSent = send(g_chatSocket, chatInput.c_str(), (int)chatInput.length(), 0);
                     if (bytesSent == SOCKET_ERROR) {
-                        std::cerr << "\n[System]: Send failed with error: " << WSAGetLastError() << "\n";
+                        std::cerr << "\n[System]: Send failed. Error: " << WSAGetLastError() << "\n";
                         g_inChat = false;
                         break;
                     }
@@ -379,20 +545,20 @@ int main() {
                 recvThread.join();
             }
 
-            std::cout << "\n[System]: Returned to the peer list.\n";
+            std::cout << "\n[System]: Returning to online peer list...\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            g_needRedraw = true;
         }
     }
 
-    // Full shutdown
+    // Full cleanup
     g_running = false;
     
-    // Wake up sockets if blocked
     SOCKET cs = g_chatSocket.exchange(INVALID_SOCKET);
     if (cs != INVALID_SOCKET) {
         closesocket(cs);
     }
 
-    // Join all background threads
     if (tcpServerThread.joinable()) tcpServerThread.join();
     if (beaconSenderThread.joinable()) beaconSenderThread.join();
     if (beaconListenerThread.joinable()) beaconListenerThread.join();
