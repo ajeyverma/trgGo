@@ -268,6 +268,11 @@ void HTTPPeerFetcher() {
                             if (devLocalIp == "::" || devLocalIp == "::ffff:127.0.0.1" || devLocalIp == "127.0.0.1" || devLocalIp == "::1") {
                                 devLocalIp = "::1";
                             }
+                            // Do not show himself in list
+                            if (devName == g_myName && devPort == g_myTcpPort) {
+                                objStart = objEnd + 1;
+                                continue;
+                            }
 
                             if (devStatus == "online" && !devName.empty() && devPort > 0) {
                                 Peer p;

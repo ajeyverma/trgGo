@@ -65,6 +65,7 @@ HWND g_hBtnConnect = NULL;
 HWND g_hEditChatLog = NULL;
 HWND g_hEditInput = NULL;
 HWND g_hBtnSend = NULL;
+HFONT g_hFont = NULL;
 
 // Active keys in the ListBox
 std::vector<std::string> g_listBoxKeys;
@@ -136,6 +137,35 @@ std::string ExecuteCommand(const std::string& cmd) {
     }
     _pclose(pipe);
     return result;
+}
+
+// Helper to get system DPI
+int GetSystemDPI() {
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef UINT (WINAPI* GetDpiForSystemFn)();
+        GetDpiForSystemFn getDpiSystem = (GetDpiForSystemFn)GetProcAddress(hUser32, "GetDpiForSystem");
+        if (getDpiSystem) {
+            return getDpiSystem();
+        }
+    }
+    HDC hdc = GetDC(NULL);
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(NULL, hdc);
+    return dpi;
+}
+
+// Helper to get window DPI
+int GetWindowDPI(HWND hWnd) {
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef UINT (WINAPI* GetDpiForWindowFn)(HWND);
+        GetDpiForWindowFn getDpi = (GetDpiForWindowFn)GetProcAddress(hUser32, "GetDpiForWindow");
+        if (getDpi) {
+            return getDpi(hWnd);
+        }
+    }
+    return GetSystemDPI();
 }
 
 // HTTP/HTTPS request executor using system curl
@@ -229,6 +259,11 @@ void HTTPPeerFetcher() {
                             }
                             if (devLocalIp == "::" || devLocalIp == "::ffff:127.0.0.1" || devLocalIp == "127.0.0.1" || devLocalIp == "::1") {
                                 devLocalIp = "::1";
+                            }
+                            // Do not show himself in list
+                            if (devName == g_myName && devPort == g_myTcpPort) {
+                                objStart = objEnd + 1;
+                                continue;
                             }
 
                             if (devStatus == "online" && !devName.empty() && devPort > 0) {
@@ -485,35 +520,52 @@ void HandleSend() {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
+            int dpi = GetWindowDPI(hWnd);
+            auto scale = [dpi](int val) { return MulDiv(val, dpi, 96); };
+
+            int fontHeight = -MulDiv(11, dpi, 72); // 11pt font size
+            g_hFont = CreateFontA(
+                fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI"
+            );
+
             // Left Panel: Online Peers
-            CreateWindowA("STATIC", "Online Peers:", WS_VISIBLE | WS_CHILD,
-                         10, 10, 180, 20, hWnd, NULL, NULL, NULL);
+            HWND hStatic1 = CreateWindowA("STATIC", "Online Peers:", WS_VISIBLE | WS_CHILD,
+                         scale(10), scale(10), scale(180), scale(20), hWnd, NULL, NULL, NULL);
+            if (hStatic1 && g_hFont) SendMessageA(hStatic1, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             
             g_hListBoxPeers = CreateWindowA("LISTBOX", NULL, 
                                           WS_VISIBLE | WS_CHILD | LBS_NOTIFY | WS_VSCROLL | WS_BORDER,
-                                          10, 35, 180, 280, hWnd, (HMENU)IDC_LISTBOX_PEERS, NULL, NULL);
+                                          scale(10), scale(35), scale(180), scale(280), hWnd, (HMENU)IDC_LISTBOX_PEERS, NULL, NULL);
+            if (g_hListBoxPeers && g_hFont) SendMessageA(g_hListBoxPeers, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             g_hBtnConnect = CreateWindowA("BUTTON", "Connect", 
                                          WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-                                         10, 325, 180, 30, hWnd, (HMENU)IDC_BTN_CONNECT, NULL, NULL);
+                                         scale(10), scale(325), scale(180), scale(30), hWnd, (HMENU)IDC_BTN_CONNECT, NULL, NULL);
+            if (g_hBtnConnect && g_hFont) SendMessageA(g_hBtnConnect, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             // Right Panel: Chat Log
-            CreateWindowA("STATIC", "Conversation history:", WS_VISIBLE | WS_CHILD,
-                         200, 10, 370, 20, hWnd, NULL, NULL, NULL);
+            HWND hStatic2 = CreateWindowA("STATIC", "Conversation history:", WS_VISIBLE | WS_CHILD,
+                         scale(200), scale(10), scale(370), scale(20), hWnd, NULL, NULL, NULL);
+            if (hStatic2 && g_hFont) SendMessageA(hStatic2, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             g_hEditChatLog = CreateWindowA("EDIT", NULL,
                                           WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_BORDER,
-                                          200, 35, 370, 240, hWnd, (HMENU)IDC_EDIT_CHATLOG, NULL, NULL);
+                                          scale(200), scale(35), scale(370), scale(240), hWnd, (HMENU)IDC_EDIT_CHATLOG, NULL, NULL);
+            if (g_hEditChatLog && g_hFont) SendMessageA(g_hEditChatLog, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             // Input fields
             g_hEditInput = CreateWindowA("EDIT", NULL,
                                         WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | WS_BORDER,
-                                        200, 285, 280, 30, hWnd, (HMENU)IDC_EDIT_INPUT, NULL, NULL);
+                                        scale(200), scale(285), scale(280), scale(30), hWnd, (HMENU)IDC_EDIT_INPUT, NULL, NULL);
+            if (g_hEditInput && g_hFont) SendMessageA(g_hEditInput, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             EnableWindow(g_hEditInput, FALSE);
 
             g_hBtnSend = CreateWindowA("BUTTON", "Send",
                                       WS_VISIBLE | WS_CHILD,
-                                      490, 285, 80, 30, hWnd, (HMENU)IDC_BTN_SEND, NULL, NULL);
+                                      scale(490), scale(285), scale(80), scale(30), hWnd, (HMENU)IDC_BTN_SEND, NULL, NULL);
+            if (g_hBtnSend && g_hFont) SendMessageA(g_hBtnSend, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             EnableWindow(g_hBtnSend, FALSE);
 
             // Print info
@@ -592,6 +644,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             g_running = false;
             KillTimer(hWnd, TIMER_REFRESH_PEERS);
             
+            // Cleanup active font
+            if (g_hFont != NULL) {
+                DeleteObject(g_hFont);
+                g_hFont = NULL;
+            }
+
             // Cleanup active sockets
             SOCKET cs = g_chatSocket.exchange(INVALID_SOCKET);
             if (cs != INVALID_SOCKET) {
@@ -612,6 +670,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 }
 
 int main() {
+    // Set process DPI awareness to prevent blurriness on high-DPI displays
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef BOOL (WINAPI* SetProcessDpiAwarenessContextFn)(HANDLE);
+        SetProcessDpiAwarenessContextFn setDpiCtx = (SetProcessDpiAwarenessContextFn)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (setDpiCtx) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is (HANDLE)-4
+            setDpiCtx((HANDLE)-4);
+        } else {
+            SetProcessDPIAware();
+        }
+    } else {
+        SetProcessDPIAware();
+    }
+
     // 1. Ask for Nickname and Tracker URL in the console window first
     std::cout << "===========================================\n";
     std::cout << "        trgGo - Native Windows GUI         \n";
@@ -686,8 +759,12 @@ int main() {
     // Center window on screen
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int winWidth = 600;
-    int winHeight = 400;
+    
+    // Scale window dimensions based on DPI
+    int systemDpi = GetSystemDPI();
+    int winWidth = MulDiv(600, systemDpi, 96);
+    int winHeight = MulDiv(400, systemDpi, 96);
+    
     int winX = (screenWidth - winWidth) / 2;
     int winY = (screenHeight - winHeight) / 2;
 
